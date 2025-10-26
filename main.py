@@ -1,20 +1,18 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import json
 import os
-import random
-import subprocess
 import sys
 import time
-from datetime import date, datetime, timedelta
 import numpy as np
 import requests
 import pandas as pd
 import preprocessing as pp
+from datetime import datetime, timedelta
 
-START_TIME = (datetime.now() - timedelta(hours=0, minutes=5))
+START_TIME = (datetime.now() - timedelta(hours=0, minutes=1))
 API_BASE = 'https://api.bybit.com/v5/'
+DEBUG_MODE = True
 
 LABELS = [
     'open_time',
@@ -40,10 +38,12 @@ def get_batch(symbol, interval='1', start_time=0, limit=1000):
         'start': start_time,
         'limit': limit
     }
+    response_json = None
     try:
         # timeout should also be given as a parameter to the function
         response = requests.get(f'{API_BASE}market/kline', params, timeout=30)
-        data = response.json()['result']['list']
+        response_json = response.json()
+        data = response_json['result']['list']
         data.reverse()
 
     except requests.exceptions.ConnectionError:
@@ -62,34 +62,39 @@ def get_batch(symbol, interval='1', start_time=0, limit=1000):
         return get_batch(symbol, interval, start_time, limit)
 
     except Exception as e:
-        print(f'Unknown error: {e}, Cooling down for 5 min...')
-        time.sleep(5 * 60)
-        return get_batch(symbol, interval, start_time, limit)
+        print(f'Unknown error: {e}, for response: {response_json}')
+        raise e
 
     if response.status_code == 200:
         df = pd.DataFrame(data, columns=LABELS)
+        df = df.drop(columns=['quote_asset_volume'])
         df['open_time'] = df['open_time'].astype(np.int64)
         df = df[df.open_time < START_TIME.timestamp() * 1000]
         return df
-    print(f'Got erroneous response back: {response}')
+
+    print(f'Got erroneous response back: {response}, {response_json}')
     return pd.DataFrame([])
 
-def all_candles_to_csv(base, quote, interval='1'):
+def append_stored_candles(base, quote, interval='1'):
     """Collect a list of candlestick batches with all candlesticks of a trading pair,
-    concat into a dataframe and write it to CSV.
+    concat into a dataframe and write it to parquet.
     """
 
-    # see if there is any data saved on disk already
+    # load from disk or start fresh
+    batches = [pd.DataFrame([], columns=LABELS)]
     try:
-        batches = [pd.read_csv(f'data/{base}-{quote}.csv')]
-        last_timestamp = batches[-1]['open_time'].max()
+        parquet_path = f'compressed/{base}-{quote}.parquet'
+        df_disk = pd.read_parquet(parquet_path)
+        pp.debug("Data from disk:")
+        pp.debug(df_disk)
+        last_timestamp = int(df_disk['datetime'].max().timestamp() * 1000)
         new_file = False
-    except FileNotFoundError:
-        batches = [pd.DataFrame([], columns=LABELS)]
+        batches = [df_disk]
+    except Exception:
         # last_timestamp = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
         last_timestamp = 1640995200000  # 2022-01-01
         new_file = True
-    old_lines = len(batches[-1].index)
+    old_lines = len(batches[-1])
 
     # gather all candlesticks available, starting from the last timestamp loaded from disk or 0
     # stop if the timestamp that comes back from the api is the same as the last one
@@ -124,25 +129,25 @@ def all_candles_to_csv(base, quote, interval='1'):
             break
 
         if not new_batch.empty:
+            new_batch['datetime'] = pd.to_datetime(new_batch['open_time'], unit='ms', utc=True)
             batches.append(new_batch)
             new_file = False
         last_datetime = datetime.fromtimestamp(last_timestamp / 1000)
 
         covering_spaces = 20 * ' '
-        print(datetime.now(), base, quote, interval + 'min', str(last_datetime)+covering_spaces, end='\r', flush=True)
+        print(datetime.now().replace(microsecond=0), base, quote, interval + 'min', str(last_datetime)+covering_spaces, end='\r', flush=True)
 
     # write clean version of csv to parquet
     parquet_name = f'{base}-{quote}.parquet'
     full_path = f'compressed/{parquet_name}'
     df = pd.concat(batches, ignore_index=True)
-    df = pp.quick_clean(df)
-
+    pp.debug("Before cleaning:")
+    pp.debug(df)
+    df = pp.clean(df)
     pp.write_raw_to_parquet(df, full_path)
 
-    # in the case that new data was gathered write it to disk
     if len(batches) > 1:
-        df.to_csv(f'data/{base}-{quote}.csv', index=False)
-        return len(df.index) - old_lines
+        return len(df) - old_lines
     return 0
 
 
@@ -153,6 +158,9 @@ def main():
     global category
     if len(sys.argv) > 1:
         category = sys.argv[1]
+
+    # pp.groom_all()
+    # exit()
 
     # get all pairs currently available
     all_symbols = pd.DataFrame(requests.get(f'{API_BASE}market/instruments-info?category=' + category).json()['result']['list'])
@@ -171,22 +179,25 @@ def main():
         else:
             filtered_pairs.append(pair)
 
-    # randomising order helps during testing and doesn't make any difference in production
-    #random.shuffle(filtered_pairs)
+    # debug, only one pair
+    if DEBUG_MODE:
+        filtered_pairs = [('BTC', 'USDT')]
 
     # make sure data folders exist
-    os.makedirs('data', exist_ok=True)
     os.makedirs('compressed', exist_ok=True)
 
     # do a full update on all pairs
     n_count = len(filtered_pairs)
     for n, pair in enumerate(filtered_pairs, 1):
-        base, quote = pair
-        new_lines = all_candles_to_csv(base=base, quote=quote)
-        if new_lines > 0:
-            print(f'{datetime.now()} {n}/{n_count} Wrote {new_lines} new lines to file for {base}-{quote}')
-        else:
-            print(f'{datetime.now()} {n}/{n_count} Already up to date with {base}-{quote}')
+        try:
+            base, quote = pair
+            new_lines = append_stored_candles(base=base, quote=quote)
+            if new_lines > 0:
+                print(f'{datetime.now()} {n}/{n_count} Wrote {new_lines} new lines to file for {base}-{quote}')
+            else:
+                print(f'{datetime.now()} {n}/{n_count} Already up to date with {base}-{quote}')
+        except Exception as e:
+            print(f'Error processing pair {pair}: {repr(e)}')
 
 
 if __name__ == '__main__':
